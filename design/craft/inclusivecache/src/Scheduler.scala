@@ -138,14 +138,23 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   sourceC.io.req.valid := schedule.c.valid
   sourceD.io.req.valid := schedule.d.valid
   sourceE.io.req.valid := schedule.e.valid
-  sourceX.io.req.valid := schedule.x.valid
+  
+  // Mux between regular MSHR responses and flush completion
+  val flush_completion = flushAllController.io.done.valid
+  sourceX.io.req.valid := schedule.x.valid || flush_completion
 
   sourceA.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.a.bits)) := schedule.a.bits
   sourceB.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.b.bits)) := schedule.b.bits
   sourceC.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.c.bits)) := schedule.c.bits
   sourceD.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.d.bits)) := schedule.d.bits
   sourceE.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.e.bits)) := schedule.e.bits
-  sourceX.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.x.bits)) := schedule.x.bits
+  
+  // Mux between regular MSHR responses and flush completion for sourceX
+  when(flush_completion) {
+    sourceX.io.req.bits.fail := false.B // Flush completed successfully
+  }.otherwise {
+    sourceX.io.req.bits.viewAsSupertype(chiselTypeOf(schedule.x.bits)) := schedule.x.bits
+  }
 
   directory.io.write.valid := schedule.dir.valid
   directory.io.write.bits.viewAsSupertype(chiselTypeOf(schedule.dir.bits)) := schedule.dir.bits
@@ -395,8 +404,8 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   val mshr_flush_responses = mshrs.map(m => m.io.schedule.bits.x.valid && m.io.schedule.fire)
   flushAllController.io.flush_resp.valid := mshr_flush_responses.reduce(_ || _)
   
-  // Allow flushall controller to signal completion
-  flushAllController.io.done.ready := true.B
+  // Connect flushAllController completion to sourceX with proper backpressure
+  flushAllController.io.done.ready := sourceX.io.req.ready && flush_completion
   
   // Coverage for flushall operations
   params.ccover(is_flushall && flushAllController.io.start.fire, "SCHEDULER_FLUSHALL_START", "FlushAll operation initiated")
