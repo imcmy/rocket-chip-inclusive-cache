@@ -185,11 +185,8 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   flushAllController.io.dir_read.ready := true.B // Always ready to accept directory reads
   
   // Route flushall directory reads to main directory (with lower priority)
-  val flushall_dir_read = flushAllController.io.dir_read.valid && !directory.io.read.valid
-  when (flushall_dir_read) {
-    directory.io.read.valid := true.B
-    directory.io.read.bits := flushAllController.io.dir_read.bits
-  }
+  val flushall_dir_read = flushAllController.io.dir_read.valid
+  
   // Connect directory result back to flushall controller
   flushAllController.io.dir_result.valid := directory.io.result.valid && flushall_dir_read
   flushAllController.io.dir_result.bits := directory.io.result.bits
