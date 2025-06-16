@@ -33,10 +33,10 @@ class FlushAllController(params: InclusiveCacheParameters) extends Module
   val io = IO(new Bundle {
     // Control interface
     val start = Flipped(Decoupled(new FlushAllRequest(params)))
-    val done = Valid(Bool())
+    val done = Decoupled(Bool())
     
     // Directory interface
-    val dir_read = Valid(new DirectoryRead(params))
+    val dir_read = Decoupled(new DirectoryRead(params))
     val dir_result = Flipped(Valid(new DirectoryResult(params)))
     
     // Request generation interface

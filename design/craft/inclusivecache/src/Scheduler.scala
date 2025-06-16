@@ -392,8 +392,8 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   // FlushAll completion handling
   // Connect flush responses from MSHRs back to flushall controller
-  val mshr_flush_responses = mshrs.map(_.io.schedule.bits.x.valid && _.io.schedule.fire)
-  flushAllController.io.flush_resp.valid := mshr_flush_responses.reduce(_||_)
+  val mshr_flush_responses = mshrs.map(m => m.io.schedule.bits.x.valid && m.io.schedule.fire)
+  flushAllController.io.flush_resp.valid := mshr_flush_responses.reduce(_ || _)
   
   // Allow flushall controller to signal completion
   flushAllController.io.done.ready := true.B
