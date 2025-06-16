@@ -183,7 +183,6 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   flushAllController.io.start.valid := is_flushall && request.valid
   flushAllController.io.start.bits.invalidate := request.bits.control.invalidate
   flushAllController.io.dir_read.ready := true.B // Always ready to accept directory reads
-  flushAllController.io.flush_resp.valid := false.B // Will be connected later
   
   // Route flushall directory reads to main directory (with lower priority)
   val flushall_dir_read = flushAllController.io.dir_read.valid && !directory.io.read.valid
@@ -403,6 +402,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   // Connect flush responses from MSHRs back to flushall controller
   val mshr_flush_responses = mshrs.map(m => m.io.schedule.bits.x.valid && m.io.schedule.fire)
   flushAllController.io.flush_resp.valid := mshr_flush_responses.reduce(_ || _)
+  flushAllController.io.flush_resp.bits := true.B // Flush responses are just success indicators
   
   // Connect flushAllController completion to sourceX with proper backpressure
   flushAllController.io.done.ready := sourceX.io.req.ready && flush_completion
