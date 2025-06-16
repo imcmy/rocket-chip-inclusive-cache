@@ -169,11 +169,13 @@ class InclusiveCache(
         val contained = edgeIn.manager.managers.flatMap(_.address)
           .map(_.contains(ctrl.module.io.flush_req.bits)).reduce(_||_)
         when (contained) { ctrl.module.io.flush_match := true.B }
+        val flushall = ctrl.module.io.flush_req.bits === 0.U
+        when (flushall) { ctrl.module.io.flush_match := true.B }
 
-        sched.io.req.valid := contained && ctrl.module.io.flush_req.valid
+        sched.io.req.valid := (contained || flushall) && ctrl.module.io.flush_req.valid
         sched.io.req.bits.address := ctrl.module.io.flush_req.bits
         sched.io.req.bits.invalidate := ctrl.module.io.invalidate_req
-        when (contained && sched.io.req.ready) { ctrl.module.io.flush_req.ready := true.B }
+        when ((contained || flushall) && sched.io.req.ready) { ctrl.module.io.flush_req.ready := true.B }
 
         when (sched.io.resp.valid) { ctrl.module.io.flush_resp := true.B }
         sched.io.resp.ready := true.B

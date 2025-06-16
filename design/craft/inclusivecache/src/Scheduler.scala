@@ -69,6 +69,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   val bankedStore = Module(new BankedStore(params))
   val requests = Module(new ListBuffer(ListBufferParameters(new QueuedRequest(params), 3*params.mshrs, params.secondary, false)))
   val mshrs = Seq.fill(params.mshrs) { Module(new MSHR(params)) }
+  val flushAllController = Module(new FlushAllController(params))
   val abc_mshrs = mshrs.init.init
   val bc_mshr = mshrs.init.last
   val c_mshr = mshrs.last
@@ -164,9 +165,30 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   request.valid := directory.io.ready && (sinkA.io.req.valid || sinkX.io.req.valid || sinkC.io.req.valid)
   request.bits := Mux(sinkC.io.req.valid, sinkC.io.req.bits,
                   Mux(sinkX.io.req.valid, sinkX.io.req.bits, sinkA.io.req.bits))
-  sinkC.io.req.ready := directory.io.ready && request.ready
-  sinkX.io.req.ready := directory.io.ready && request.ready && !sinkC.io.req.valid
-  sinkA.io.req.ready := directory.io.ready && request.ready && !sinkC.io.req.valid && !sinkX.io.req.valid
+  
+  // Detect flushall request (address 0 with flush control)
+  val is_flushall = request.valid && request.bits.control.flush && 
+                    request.bits.set === 0.U && request.bits.tag === 0.U
+  
+  // FlushAll controller connections
+  flushAllController.io.start.valid := is_flushall && request.valid
+  flushAllController.io.start.bits.invalidate := request.bits.control.invalidate
+  flushAllController.io.dir_read.ready := true.B // Always ready to accept directory reads
+  flushAllController.io.flush_resp.valid := false.B // Will be connected later
+  
+  // Route flushall directory reads to main directory (with lower priority)
+  val flushall_dir_read = flushAllController.io.dir_read.valid && !directory.io.read.valid
+  when (flushall_dir_read) {
+    directory.io.read.valid := true.B
+    directory.io.read.bits := flushAllController.io.dir_read.bits
+  }
+  // Connect directory result back to flushall controller
+  flushAllController.io.dir_result.valid := directory.io.result.valid && flushall_dir_read
+  flushAllController.io.dir_result.bits := directory.io.result.bits
+  
+  sinkC.io.req.ready := directory.io.ready && request.ready && !is_flushall
+  sinkX.io.req.ready := directory.io.ready && (flushAllController.io.start.ready || request.ready) && !sinkC.io.req.valid
+  sinkA.io.req.ready := directory.io.ready && request.ready && !sinkC.io.req.valid && !sinkX.io.req.valid && !is_flushall
 
   // If no MSHR has been assigned to this set, we need to allocate one
   val setMatches = Cat(mshrs.map { m => m.io.status.valid && m.io.status.bits.set === request.bits.set }.reverse)
@@ -258,16 +280,32 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
      (alloc && !mshr_uses_directory_assuming_no_bypass && mshr_free) ||
      (nestB && !mshr_uses_directory_assuming_no_bypass && !bc_mshr.io.status.valid && !c_mshr.io.status.valid) ||
      (nestC && !mshr_uses_directory_assuming_no_bypass && !c_mshr.io.status.valid)
-  request.ready := request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready))
-  val alloc_uses_directory = request.valid && request_alloc_cases
+  
+  // Handle regular requests and flushall controller requests
+  val regular_request_ready = request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready))
+  request.ready := Mux(is_flushall, flushAllController.io.start.ready, regular_request_ready)
+  val alloc_uses_directory = request.valid && request_alloc_cases && !is_flushall
+
+  // Create a unified request stream that includes flushall controller requests
+  val unified_request = Wire(Decoupled(new FullRequest(params)))
+  unified_request.valid := request.valid && !is_flushall || flushAllController.io.flush_req.valid
+  unified_request.bits := Mux(flushAllController.io.flush_req.valid, 
+                              flushAllController.io.flush_req.bits, 
+                              request.bits)
+  unified_request.ready := DontCare // Will be overridden below
+  
+  // Connect flushall controller request acceptance
+  flushAllController.io.flush_req.ready := unified_request.ready && flushAllController.io.flush_req.valid
 
   // When a request goes through, it will need to hit the Directory
-  directory.io.read.valid := mshr_uses_directory || alloc_uses_directory
-  directory.io.read.bits.set := Mux(mshr_uses_directory_for_lb, scheduleSet,          request.bits.set)
-  directory.io.read.bits.tag := Mux(mshr_uses_directory_for_lb, requests.io.data.tag, request.bits.tag)
+  directory.io.read.valid := mshr_uses_directory || alloc_uses_directory || flushall_dir_read
+  directory.io.read.bits.set := Mux(flushall_dir_read, flushAllController.io.dir_read.bits.set,
+                                Mux(mshr_uses_directory_for_lb, scheduleSet, request.bits.set))
+  directory.io.read.bits.tag := Mux(flushall_dir_read, flushAllController.io.dir_read.bits.tag,
+                                Mux(mshr_uses_directory_for_lb, requests.io.data.tag, request.bits.tag))
 
   // Enqueue the request if not bypassed directly into an MSHR
-  requests.io.push.valid := request.valid && queue && !bypassQueue
+  requests.io.push.valid := request.valid && queue && !bypassQueue && !is_flushall
   requests.io.push.bits.data  := request.bits
   requests.io.push.bits.index := Mux1H(
     request.bits.prio, Seq(
@@ -275,11 +313,20 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
       OHToUInt(lowerMatches1 << params.mshrs*1),
       OHToUInt(lowerMatches1 << params.mshrs*2)))
 
-  val mshr_insertOH = ~(leftOR(~mshr_validOH) << 1) & ~mshr_validOH & prioFilter
-  (mshr_insertOH.asBools zip mshrs) map { case (s, m) =>
-    when (request.valid && alloc && s && !mshr_uses_directory_assuming_no_bypass) {
+  // Re-compute allocation conditions for unified request
+  val unified_setMatches = Cat(mshrs.map { m => m.io.status.valid && m.io.status.bits.set === unified_request.bits.set }.reverse)
+  val unified_alloc = !unified_setMatches.orR
+  val unified_prioFilter = Cat(unified_request.bits.prio(2), !unified_request.bits.prio(0), ~0.U((params.mshrs-2).W))
+  val unified_mshr_free = (~mshr_validOH & unified_prioFilter).orR
+  val unified_request_alloc_cases = unified_alloc && unified_mshr_free && !mshr_uses_directory_assuming_no_bypass
+  
+  unified_request.ready := unified_request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready)) && !flushAllController.io.flush_req.valid
+
+  val mshr_insertOH = ~(leftOR(~mshr_validOH) << 1) & ~mshr_validOH & unified_prioFilter
+  mshr_insertOH.asBools.zip(mshrs).map { case (s, m) =>
+    when (unified_request.valid && unified_request_alloc_cases && s) {
       m.io.allocate.valid := true.B
-      m.io.allocate.bits.viewAsSupertype(chiselTypeOf(request.bits)) := request.bits
+      m.io.allocate.bits.viewAsSupertype(chiselTypeOf(unified_request.bits)) := unified_request.bits
       m.io.allocate.bits.repeat := false.B
     }
   }
@@ -342,6 +389,19 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   sourceD.io.grant_req := sinkD  .io.grant_req
   sourceC.io.evict_safe := sourceD.io.evict_safe
   sinkD  .io.grant_safe := sourceD.io.grant_safe
+
+  // FlushAll completion handling
+  // Connect flush responses from MSHRs back to flushall controller
+  val mshr_flush_responses = mshrs.map(_.io.schedule.bits.x.valid && _.io.schedule.fire)
+  flushAllController.io.flush_resp.valid := mshr_flush_responses.reduce(_||_)
+  
+  // Allow flushall controller to signal completion
+  flushAllController.io.done.ready := true.B
+  
+  // Coverage for flushall operations
+  params.ccover(is_flushall && flushAllController.io.start.fire, "SCHEDULER_FLUSHALL_START", "FlushAll operation initiated")
+  params.ccover(flushAllController.io.done.fire, "SCHEDULER_FLUSHALL_COMPLETE", "FlushAll operation completed")
+  params.ccover(flushAllController.io.flush_req.fire, "SCHEDULER_FLUSHALL_INDIVIDUAL_FLUSH", "Individual flush issued during FlushAll")
 
   private def afmt(x: AddressSet) = s"""{"base":${x.base},"mask":${x.mask}}"""
   private def addresses = params.inner.manager.managers.flatMap(_.address).map(afmt _).mkString(",")
